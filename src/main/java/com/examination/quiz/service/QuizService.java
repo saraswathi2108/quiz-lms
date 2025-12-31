@@ -1,0 +1,226 @@
+package com.examination.quiz.service;
+
+import com.examination.quiz.client.CourseClient;
+import com.examination.quiz.dto.*;
+import com.examination.quiz.entity.Option;
+import com.examination.quiz.entity.Question;
+import com.examination.quiz.entity.Quiz;
+import com.examination.quiz.repository.OptionRepository;
+import com.examination.quiz.repository.QuestionRepository;
+import com.examination.quiz.repository.QuizRepository;
+import jakarta.transaction.Transactional;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Transactional
+@Slf4j
+public class QuizService {
+
+    private final QuizRepository quizRepository;
+    private final QuestionRepository questionRepository;
+    private final OptionRepository optionRepository;
+    private final CourseClient courseClient;
+
+
+    public QuizCreateResponse createQuiz(QuizCreateRequest request) {
+        validateRequest(request);
+        validateWithCourseService(request);
+
+        Quiz quiz = Quiz.builder()
+                .quizType(request.getQuizType())
+                .courseId(request.getCourseId())
+                .lectureId(request.getLectureId())
+                .totalMarks(request.getTotalMarks())
+                .build();
+
+        quizRepository.save(quiz);
+
+        List<Question> questions = new ArrayList<>();
+        List<Option> options = new ArrayList<>();
+
+        for (QuestionRequest qr : request.getQuestions()) {
+            Question question = Question.builder()
+                    .quiz(quiz)
+                    .questionText(qr.getQuestionText())
+                    .questionType(qr.getQuestionType())
+                    .marks(qr.getMarks())
+                    .build();
+
+            questions.add(question);
+
+            for (int i = 0; i < qr.getOptions().size(); i++) {
+                options.add(
+                        Option.builder()
+                                .question(question)
+                                .optionText(qr.getOptions().get(i))
+                                .isCorrect(qr.getCorrectOptionIndexes().contains(i))
+                                .build()
+                );
+            }
+        }
+
+        questionRepository.saveAll(questions);
+        optionRepository.saveAll(options);
+
+        return new QuizCreateResponse(
+                quiz.getId(),
+                quiz.getQuizType(),
+                quiz.getCourseId(),
+                quiz.getLectureId(),
+                questions.size(),
+                "Quiz created successfully",
+                request.getQuestions()
+        );
+    }
+
+
+    public List<QuizCreateResponse> createQuizzesBulk(List<QuizCreateRequest> requests) {
+        if (requests == null || requests.isEmpty()) {
+            throw new IllegalArgumentException("Quiz list cannot be empty");
+        }
+        List<QuizCreateResponse> responses = new ArrayList<>();
+        for (QuizCreateRequest request : requests) {
+            responses.add(createQuiz(request));
+        }
+        return responses;
+    }
+
+    private void validateRequest(QuizCreateRequest request) {
+        if (request.getCourseId() == null) throw new IllegalArgumentException("courseId is mandatory");
+        if (request.getQuizType() == null) throw new IllegalArgumentException("quizType is mandatory");
+        if ("LECTURE".equals(request.getQuizType())) {
+            if (request.getLectureId() == null) throw new IllegalArgumentException("lectureId is mandatory for lecture quiz");
+            if (quizRepository.existsByLectureId(request.getLectureId())) throw new IllegalStateException("Quiz already exists for this lecture");
+        }
+        if ("GRAND".equals(request.getQuizType()) && request.getLectureId() != null) {
+            throw new IllegalArgumentException("lectureId must be null for grand quiz");
+        }
+        if (request.getQuestions() == null || request.getQuestions().isEmpty()) {
+            throw new IllegalArgumentException("At least one question is required");
+        }
+        request.getQuestions().forEach(q -> {
+            if ("MCQ".equals(q.getQuestionType()) && q.getCorrectOptionIndexes().size() != 1) {
+                throw new IllegalArgumentException("MCQ must have exactly one correct answer");
+            }
+        });
+    }
+
+    private void validateWithCourseService(QuizCreateRequest request) {
+        ApiResponse<CourseResponseDTO> courseResponse = courseClient.getCourse(request.getCourseId());
+        if (courseResponse == null || courseResponse.getData() == null) throw new IllegalArgumentException("Course not found");
+        if ("LECTURE".equals(request.getQuizType())) {
+            ApiResponse<LectureResponseDTO> lectureResponse = courseClient.getLecture(request.getCourseId(), request.getLectureId());
+            if (lectureResponse == null || lectureResponse.getData() == null) throw new IllegalArgumentException("Lecture not found");
+        }
+    }
+
+    public List<QuizCreateResponse> getQuizzesByCourse(Long courseId) {
+        List<Quiz> quizzes = quizRepository.findByCourseId(courseId);
+        return quizzes.stream().map(this::mapToResponseWithQuestions).collect(Collectors.toList());
+    }
+
+    public QuizCreateResponse getGrandQuizByCourse(Long courseId) {
+        Quiz quiz = quizRepository.findByCourseIdAndQuizType(courseId, "GRAND").stream().findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Grand quiz not found"));
+        return mapToResponseWithQuestions(quiz);
+    }
+
+    public QuizCreateResponse getQuizByLecture(Long lectureId) {
+        Quiz quiz = quizRepository.findByLectureId(lectureId)
+                .orElseThrow(() -> new IllegalArgumentException("Lecture quiz not found"));
+        return mapToResponseWithQuestions(quiz);
+    }
+
+
+    public QuizSubmitResponse submitQuiz(QuizSubmitRequest request) {
+        Quiz quiz = quizRepository.findById(request.getQuizId())
+                .orElseThrow(() -> new IllegalArgumentException("Quiz not found"));
+
+        List<Question> questions = questionRepository.findByQuizId(quiz.getId());
+
+        int totalQuestions = questions.size();
+        int correctAnswers = 0;
+        int obtainedMarks = 0;
+
+        for (Question question : questions) {
+            QuestionAnswerDTO answer = request.getAnswers()
+                    .stream()
+                    .filter(a -> a.getQuestionId().equals(question.getId()))
+                    .findFirst()
+                    .orElse(null);
+
+            if (answer == null) continue;
+
+            List<Option> options = optionRepository.findByQuestionId(question.getId());
+
+            Set<Integer> correctIndexes = options.stream()
+                    .filter(Option::getIsCorrect)
+                    .map(o -> options.indexOf(o))
+                    .collect(Collectors.toSet());
+
+            Set<Integer> selectedIndexes = Set.copyOf(answer.getSelectedOptionIndexes());
+
+            if (correctIndexes.equals(selectedIndexes)) {
+                correctAnswers++;
+                obtainedMarks += question.getMarks();
+            }
+        }
+
+        boolean passed = obtainedMarks >= (quiz.getTotalMarks() * 0.4);
+
+        return new QuizSubmitResponse(
+                quiz.getId(),
+                totalQuestions,
+                correctAnswers,
+                quiz.getTotalMarks(),
+                obtainedMarks,
+                passed
+        );
+    }
+
+    private QuizCreateResponse mapToResponseWithQuestions(Quiz quiz) {
+        List<Question> questions = questionRepository.findByQuizId(quiz.getId());
+
+        List<QuestionRequest> questionDTOs = questions.stream().map(q -> {
+            List<Option> opts = optionRepository.findByQuestionId(q.getId());
+
+            List<String> optionTexts = opts.stream()
+                    .map(Option::getOptionText)
+                    .collect(Collectors.toList());
+
+            List<Integer> correctIndexes = new ArrayList<>();
+            for (int i = 0; i < opts.size(); i++) {
+                if (opts.get(i).getIsCorrect()) {
+                    correctIndexes.add(i);
+                }
+            }
+
+            return new QuestionRequest(
+                    q.getId(),
+                    q.getQuestionText(),
+                    q.getQuestionType(),
+                    q.getMarks(),
+                    optionTexts,
+                    correctIndexes
+            );
+        }).collect(Collectors.toList());
+
+        return new QuizCreateResponse(
+                quiz.getId(),
+                quiz.getQuizType(),
+                quiz.getCourseId(),
+                quiz.getLectureId(),
+                questions.size(),
+                "Quiz fetched successfully",
+                questionDTOs
+        );
+    }
+}

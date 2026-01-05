@@ -10,7 +10,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 
 @FeignClient(
         name = "course-service",
-        url = "http://192.168.0.249:8088",
+        url = "http://192.168.0.111:8088",
         configuration = FeignAuthConfig.class
 )
 public interface CourseClient {
